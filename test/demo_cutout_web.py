@@ -439,8 +439,8 @@ def main():
     .canvas-wrap {
       min-width: 0;
       display: flex;
-      align-items: center;
-      justify-content: center;
+      align-items: flex-start;
+      justify-content: flex-start;
       height: calc(100vh - 24px);
       overflow: auto;
       padding: 7px;
@@ -460,6 +460,7 @@ def main():
       position: relative;
       display: inline-block;
       flex: 0 0 auto;
+      margin: auto;
       overflow: hidden;
       border: 1px solid rgba(24,33,31,0.2);
       border-radius: 13px;
@@ -534,6 +535,7 @@ def main():
       <div class="button-row">
         <button id="toolBrushBtn" onclick="setTool('brush')">Brush</button>
         <button id="toolPenBtn" onclick="setTool('pen')">Pen</button>
+        <button id="toolMoveBtn" onclick="setTool('move')">Move</button>
       </div>
       <label id="brushSizePanel" class="brush-control">Brush Size <input id="brush" type="range" min="2" max="80" value="20"/></label>
     </div>
@@ -594,7 +596,8 @@ let brushPreview = null;
 let imageFitScale = 1;
 let imageScaleFactor = 1;
 let resizeDrag = null;
-let resizeRaf = null;
+let panDrag = null;
+let suppressNextContextMenu = false;
 let undoStack = [];
 const brushInput = document.getElementById("brush");
 const uploadImagesInput = document.getElementById("uploadImages");
@@ -611,7 +614,6 @@ const handleRadius = 8;
 const segmentHitRadius = 7;
 const dragThreshold = 3;
 const sampleSteps = 36;
-const resizeHitSize = 14;
 
 function clonePoint(p){
   return {
@@ -713,7 +715,8 @@ function updateShortcutHelp(){
     modeText,
     "Ctrl+Z：撤销上一步编辑。",
     "Ctrl+K / Ctrl+Backspace / Ctrl+Delete：清空当前 mask。",
-    "Save：保存当前帧的 overlay 和 cutout。"
+    "Save：保存当前帧的 overlay 和 cutout。",
+    "Ctrl+右键上下拖动：以鼠标位置为中心缩放图片；向上放大，向下缩小。"
   ];
   const brushTips = [
     "Brush：鼠标圆圈显示笔刷大小，拖动即可涂抹。",
@@ -727,21 +730,29 @@ function updateShortcutHelp(){
     "右键锚点/手柄：直线/曲线切换或删除锚点。",
     "C：闭合路径；Enter：把闭合路径生成选区并合并到 mask；Esc：清空当前钢笔路径。"
   ];
-  const tips = (tool === "pen" ? penTips : brushTips).concat(common);
+  const moveTips = [
+    "Move：鼠标左键拖动图片，只移动视图，不修改 mask 或钢笔路径。",
+    "适合放大后查看局部区域；需要编辑时切回 Brush 或 Pen。"
+  ];
+  const toolTips = tool === "pen" ? penTips : (tool === "move" ? moveTips : brushTips);
+  const tips = toolTips.concat(common);
   help.innerHTML = tips.map(t => `<li>${t}</li>`).join("");
 }
 
 function updateToolButtons(){
   document.getElementById("toolBrushBtn").classList.toggle("active", tool === "brush");
   document.getElementById("toolPenBtn").classList.toggle("active", tool === "pen");
+  document.getElementById("toolMoveBtn").classList.toggle("active", tool === "move");
   document.getElementById("penCount").textContent = "Pts: " + penPoints.length + (isPenClosed ? " (closed)" : "");
   document.getElementById("brushSizePanel").classList.toggle("visible", tool === "brush");
   document.getElementById("penPathPanel").classList.toggle("visible", tool === "pen");
-  overlayCanvas.style.cursor = tool === "pen" ? "crosshair" : (tool === "brush" ? "none" : "default");
+  overlayCanvas.style.cursor = tool === "pen" ? "crosshair" : (tool === "brush" ? "none" : "grab");
   if(tool === "pen"){
-    overlayCanvas.title = "Pen: click empty canvas to add a corner, click-drag while adding for Bezier handles, drag anchors/handles to edit, right-click an anchor/handle to toggle straight/curve or delete it, click the first anchor to close, Enter to merge.";
+    overlayCanvas.title = "Pen: click empty canvas to add a corner, click-drag while adding for Bezier handles, drag anchors/handles to edit, right-click an anchor/handle to toggle straight/curve or delete it, Ctrl+right-drag vertically to zoom around the mouse.";
+  } else if(tool === "move"){
+    overlayCanvas.title = "Move: left-drag to pan the image without changing the mask. Ctrl+right-drag vertically to zoom around the mouse.";
   } else {
-    overlayCanvas.title = "Brush: paint foreground/background edits into the mask. The cursor circle shows the brush size.";
+    overlayCanvas.title = "Brush: paint foreground/background edits into the mask. Ctrl+right-drag vertically to zoom around the mouse.";
   }
   updateShortcutHelp();
 }
@@ -755,6 +766,7 @@ function setMode(m){
 function setTool(t){
   tool = t;
   dragObject = null;
+  panDrag = null;
   selectedPenObject = null;
   if(tool !== "brush"){
     brushPreview = null;
@@ -895,53 +907,27 @@ function screenToImagePx(px){
   return px / Math.max(getDisplayScale(), 0.0001);
 }
 
-function getResizeHandle(e){
-  if(!baseImage.naturalWidth || !baseImage.naturalHeight){
-    return null;
+function updateResizeCursor(e){
+  if(isMouseDown || resizeDrag || !e.ctrlKey){
+    return false;
   }
   const rect = baseImage.getBoundingClientRect();
   const x = e.clientX - rect.left;
   const y = e.clientY - rect.top;
   if(x < 0 || y < 0 || x > rect.width || y > rect.height){
-    return null;
-  }
-  const nearRight = rect.width - x <= resizeHitSize;
-  const nearBottom = rect.height - y <= resizeHitSize;
-  if(nearRight && nearBottom){
-    return "corner";
-  }
-  if(nearRight){
-    return "right";
-  }
-  if(nearBottom){
-    return "bottom";
-  }
-  return null;
-}
-
-function updateResizeCursor(e){
-  if(isMouseDown || resizeDrag){
     return false;
   }
-  const handle = getResizeHandle(e);
-  if(!handle){
-    return false;
-  }
-  overlayCanvas.style.cursor = handle === "right" ? "ew-resize" : (handle === "bottom" ? "ns-resize" : "nwse-resize");
+  overlayCanvas.style.cursor = "ns-resize";
   return true;
 }
 
-function beginImageResize(e, handle){
-  const rect = baseImage.getBoundingClientRect();
+function beginImageResize(e){
   resizeDrag = {
-    handle,
-    startX: e.clientX,
     startY: e.clientY,
-    startW: rect.width,
-    startH: rect.height,
     startScaleFactor: imageScaleFactor
   };
   isMouseDown = true;
+  suppressNextContextMenu = true;
   brushPreview = null;
   hidePenContextMenu();
   window.addEventListener("mousemove", onResizeWindowMove);
@@ -949,21 +935,7 @@ function beginImageResize(e, handle){
   e.preventDefault();
 }
 
-function scheduleResizeUpdate(){
-  if(resizeRaf !== null){
-    return;
-  }
-  resizeRaf = requestAnimationFrame(() => {
-    resizeRaf = null;
-    updateSize();
-  });
-}
-
 function flushResizeUpdate(){
-  if(resizeRaf !== null){
-    cancelAnimationFrame(resizeRaf);
-    resizeRaf = null;
-  }
   updateSize();
 }
 
@@ -971,19 +943,47 @@ function applyImageResize(e){
   if(!resizeDrag){
     return false;
   }
-  const dx = e.clientX - resizeDrag.startX;
+  const wrap = document.querySelector(".canvas-wrap");
+  const rect = baseImage.getBoundingClientRect();
+  const anchorX = Math.max(0, Math.min(baseImage.naturalWidth, (e.clientX - rect.left) * baseImage.naturalWidth / Math.max(rect.width, 1)));
+  const anchorY = Math.max(0, Math.min(baseImage.naturalHeight, (e.clientY - rect.top) * baseImage.naturalHeight / Math.max(rect.height, 1)));
   const dy = e.clientY - resizeDrag.startY;
-  const scaleFromW = (resizeDrag.startW + dx) / baseImage.naturalWidth;
-  const scaleFromH = (resizeDrag.startH + dy) / baseImage.naturalHeight;
-  let nextScale = scaleFromW;
-  if(resizeDrag.handle === "bottom"){
-    nextScale = scaleFromH;
-  } else if(resizeDrag.handle === "corner"){
-    const dominantDelta = Math.abs(dx / Math.max(resizeDrag.startW, 1)) >= Math.abs(dy / Math.max(resizeDrag.startH, 1)) ? dx / Math.max(resizeDrag.startW, 1) : dy / Math.max(resizeDrag.startH, 1);
-    nextScale = (1 + dominantDelta) * (resizeDrag.startW / baseImage.naturalWidth);
+
+  // Ctrl + right-drag: upward zooms in, downward zooms out.
+  imageScaleFactor = Math.max(0.1, Math.min(8, resizeDrag.startScaleFactor * Math.exp(-dy / 180)));
+  flushResizeUpdate();
+
+  const nextRect = baseImage.getBoundingClientRect();
+  const displayScale = nextRect.width / Math.max(baseImage.naturalWidth, 1);
+  wrap.scrollLeft += nextRect.left + anchorX * displayScale - e.clientX;
+  wrap.scrollTop += nextRect.top + anchorY * displayScale - e.clientY;
+  return true;
+}
+
+function beginImagePan(e){
+  const wrap = document.querySelector(".canvas-wrap");
+  panDrag = {
+    startX: e.clientX,
+    startY: e.clientY,
+    startScrollLeft: wrap.scrollLeft,
+    startScrollTop: wrap.scrollTop
+  };
+  isMouseDown = true;
+  brushPreview = null;
+  hidePenContextMenu();
+  overlayCanvas.style.cursor = "grabbing";
+  window.addEventListener("mousemove", onResizeWindowMove);
+  window.addEventListener("mouseup", onResizeWindowUp);
+  e.preventDefault();
+}
+
+function applyImagePan(e){
+  if(!panDrag){
+    return false;
   }
-  imageScaleFactor = Math.max(0.1, Math.min(8, nextScale / Math.max(imageFitScale, 0.0001)));
-  scheduleResizeUpdate();
+  const wrap = document.querySelector(".canvas-wrap");
+  wrap.scrollLeft = panDrag.startScrollLeft - (e.clientX - panDrag.startX);
+  wrap.scrollTop = panDrag.startScrollTop - (e.clientY - panDrag.startY);
   return true;
 }
 
@@ -1470,9 +1470,12 @@ function beginNewAnchor(p){
 }
 
 function onPointerDown(e){
-  const resizeHandle = getResizeHandle(e);
-  if(e.button === 0 && resizeHandle){
-    beginImageResize(e, resizeHandle);
+  if(e.button === 2 && e.ctrlKey){
+    beginImageResize(e);
+    return;
+  }
+  if(tool === "move" && e.button === 0){
+    beginImagePan(e);
     return;
   }
   const p = getPos(e);
@@ -1480,6 +1483,9 @@ function onPointerDown(e){
     hidePenContextMenu();
   }
   if(tool === "brush"){
+    if(e.button !== 0){
+      return;
+    }
     if(!brushDirty){
       pushUndo();
       brushDirty = true;
@@ -1573,10 +1579,13 @@ function onResizeWindowMove(e){
   if(resizeDrag && e.target !== overlayCanvas){
     applyImageResize(e);
   }
+  if(panDrag && e.target !== overlayCanvas){
+    applyImagePan(e);
+  }
 }
 
 function onResizeWindowUp(e){
-  if(resizeDrag){
+  if(resizeDrag || panDrag){
     onPointerUp(e);
   }
 }
@@ -1586,7 +1595,15 @@ function onPointerMove(e){
     applyImageResize(e);
     return;
   }
+  if(panDrag){
+    applyImagePan(e);
+    return;
+  }
   if(updateResizeCursor(e)){
+    return;
+  }
+  if(tool === "move"){
+    overlayCanvas.style.cursor = "grab";
     return;
   }
   const p = getPos(e);
@@ -1660,6 +1677,14 @@ function onPointerUp(e){
     updateResizeCursor(e) || updateToolButtons();
     return;
   }
+  if(panDrag){
+    window.removeEventListener("mousemove", onResizeWindowMove);
+    window.removeEventListener("mouseup", onResizeWindowUp);
+    panDrag = null;
+    isMouseDown = false;
+    updateToolButtons();
+    return;
+  }
   if(tool === "pen" && dragObject && dragObject.type === "newAnchor" && !dragObject.moved){
     const idx = dragObject.index;
     if(penPoints[idx]){
@@ -1701,6 +1726,11 @@ brushInput.addEventListener("input", () => {
 });
 uploadImagesInput.addEventListener("change", uploadImages);
 overlayCanvas.addEventListener("contextmenu", (e) => {
+  if(suppressNextContextMenu || e.ctrlKey || resizeDrag){
+    suppressNextContextMenu = false;
+    e.preventDefault();
+    return;
+  }
   if(tool !== "pen"){
     return;
   }
