@@ -547,6 +547,10 @@ def guided_refine_mask(mask, image,
     if mask_uint8.max() <= 1:
         mask_uint8 = mask_uint8 * 255
 
+    if (not hasattr(cv2, "ximgproc")) or (not hasattr(cv2.ximgproc, "guidedFilter")):
+        # ximgproc.guidedFilter is optional; in headless/minimal builds return original mask.
+        return mask_uint8
+
     # Empty mask: nothing to refine
     if np.count_nonzero(mask_uint8) == 0:
         return mask_uint8

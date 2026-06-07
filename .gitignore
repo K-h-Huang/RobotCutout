@@ -9,6 +9,8 @@ __pycache__/
 # checkpoint 
 *.pt
 
+# cutout res
+test/demo_video_web_output/*
 # Distribution / packaging
 .Python
 build/
