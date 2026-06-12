@@ -4,6 +4,7 @@
 
 import argparse
 import base64
+import contextlib
 import os
 import time
 from pathlib import Path
@@ -90,6 +91,18 @@ def build_arg_parser():
     )
     parser.add_argument("--host", default="127.0.0.1", help="Flask host.")
     parser.add_argument("--port", type=int, default=8080, help="Flask port.")
+    parser.add_argument(
+        "--device",
+        default="auto",
+        choices=["auto", "cuda", "cpu"],
+        help="Torch device for inference. Use auto to prefer CUDA when available.",
+    )
+    parser.add_argument(
+        "--cuda_device",
+        type=int,
+        default=0,
+        help="CUDA device index used when --device resolves to cuda.",
+    )
     parser.add_argument("--max_frames", type=int, default=0, help="If >0, only process first N frames.")
     parser.add_argument(
         "--output_format",
@@ -113,6 +126,31 @@ def build_arg_parser():
         help="Subfolder name for overlay results under output_root/category.",
     )
     return parser
+
+
+def resolve_torch_device(torch, device_arg, cuda_device):
+    if device_arg == "auto":
+        device_arg = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if device_arg == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested, but torch.cuda.is_available() is false.")
+        if cuda_device < 0 or cuda_device >= torch.cuda.device_count():
+            raise RuntimeError(
+                f"CUDA device index {cuda_device} is out of range; "
+                f"available device count: {torch.cuda.device_count()}."
+            )
+        torch.cuda.set_device(cuda_device)
+        return f"cuda:{cuda_device}"
+
+    return "cpu"
+
+
+def torch_autocast_context(torch, device):
+    device_type = torch.device(device).type
+    if device_type == "cuda":
+        return torch.autocast("cuda", dtype=torch.bfloat16)
+    return contextlib.nullcontext()
 
 
 def main():
@@ -147,13 +185,14 @@ def main():
     import torch
     from robotseg.build_robotseg import build_robotseg_video_predictor
 
-    torch.cuda.set_device(0)
-    predictor = build_robotseg_video_predictor(model_cfg, checkpoint)
+    device = resolve_torch_device(torch, args.device, args.cuda_device)
+    print(f"Using torch device: {device}")
+    predictor = build_robotseg_video_predictor(model_cfg, checkpoint, device=device)
 
     # Run inference once
     print("Running inference...")
     results = {}
-    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+    with torch.inference_mode(), torch_autocast_context(torch, device):
         state = predictor.init_state(
             video_path=str(input_dir),
             async_loading_frames=False,
@@ -205,7 +244,7 @@ def main():
         if len(images) == 0:
             return []
         upload_results = {}
-        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.inference_mode(), torch_autocast_context(torch, device):
             state = predictor.init_state(
                 video_path=str(video_dir),
                 async_loading_frames=False,
