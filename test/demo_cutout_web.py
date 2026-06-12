@@ -153,6 +153,23 @@ def torch_autocast_context(torch, device):
     return contextlib.nullcontext()
 
 
+def resolve_model_paths(project_root, yaml_name, checkpoint_name):
+    candidate_roots = [Path(project_root).resolve(), DEFAULT_PROJECT_ROOT.resolve()]
+    seen_roots = set()
+
+    for root in candidate_roots:
+        if root in seen_roots:
+            continue
+        seen_roots.add(root)
+
+        model_cfg_path = root / "robotseg" / "configs" / f"{yaml_name}.yaml"
+        checkpoint_path = root / "checkpoints" / f"{checkpoint_name}.pt"
+        if model_cfg_path.exists() and checkpoint_path.exists():
+            return f"configs/{yaml_name}.yaml", str(checkpoint_path.resolve()), root
+
+    raise FileNotFoundError(f"Config/checkpoint not found under: {Path(project_root).resolve()}")
+
+
 def main():
     args = build_arg_parser().parse_args()
     input_dir = Path(args.input_dir).resolve()
@@ -170,17 +187,7 @@ def main():
     os.makedirs(overlay_dir, exist_ok=True)
     os.makedirs(cutout_dir, exist_ok=True)
 
-    model_cfg = str((project_root / "robotseg" / "configs" / f"{args.yaml}.yaml").resolve())
-    checkpoint = str((project_root / "checkpoints" / f"{args.checkpoint}.pt").resolve())
-    if not (Path(model_cfg).exists() and Path(checkpoint).exists()):
-        # fallback to test parent, which is common for current workspace layout
-        fallback_root = Path(__file__).resolve().parent.parent
-        model_cfg_fb = str((fallback_root / "robotseg" / "configs" / f"{args.yaml}.yaml").resolve())
-        checkpoint_fb = str((fallback_root / "checkpoints" / f"{args.checkpoint}.pt").resolve())
-        if Path(model_cfg_fb).exists() and Path(checkpoint_fb).exists():
-            model_cfg, checkpoint, project_root = model_cfg_fb, checkpoint_fb, fallback_root
-        else:
-            raise FileNotFoundError(f"Config/checkpoint not found under: {project_root}")
+    model_cfg, checkpoint, project_root = resolve_model_paths(project_root, args.yaml, args.checkpoint)
 
     import torch
     from robotseg.build_robotseg import build_robotseg_video_predictor
