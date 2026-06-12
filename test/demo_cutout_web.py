@@ -51,6 +51,29 @@ def get_image_list(input_dir):
     return natsorted(image_list)
 
 
+def prepare_robotseg_jpg_frames(frame_dir, images, *, source_paths=None):
+    """RobotSeg video loader expects numerically named JPEG frames."""
+    frame_dir = Path(frame_dir)
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    for old_frame in frame_dir.glob("*.jpg"):
+        old_frame.unlink()
+
+    frame_paths = []
+    for idx, image in enumerate(images):
+        if source_paths is not None:
+            image = cv2.imread(str(source_paths[idx]), cv2.IMREAD_COLOR)
+            if image is None:
+                raise RuntimeError(f"Failed to read image: {source_paths[idx]}")
+        elif image is None:
+            raise RuntimeError(f"Invalid image at index {idx}")
+
+        frame_path = frame_dir / f"{idx:05d}.jpg"
+        if not cv2.imwrite(str(frame_path), image, [int(cv2.IMWRITE_JPEG_QUALITY), 95]):
+            raise RuntimeError(f"Failed to write RobotSeg JPEG frame: {frame_path}")
+        frame_paths.append(frame_path)
+    return frame_dir, frame_paths
+
+
 def get_data_url(img_bgr, ext="jpg", include_alpha=False):
     if include_alpha and img_bgr is not None and img_bgr.ndim == 3 and img_bgr.shape[2] == 4:
         ok, buf = cv2.imencode(".png", img_bgr)
@@ -186,6 +209,11 @@ def main():
     cutout_dir = output_root / args.category / args.cutout_dirname
     os.makedirs(overlay_dir, exist_ok=True)
     os.makedirs(cutout_dir, exist_ok=True)
+    robotseg_input_dir, _ = prepare_robotseg_jpg_frames(
+        output_root / args.category / "_robotseg_input_frames",
+        [None] * len(image_list),
+        source_paths=image_list,
+    )
 
     model_cfg, checkpoint, project_root = resolve_model_paths(project_root, args.yaml, args.checkpoint)
 
@@ -201,7 +229,7 @@ def main():
     results = {}
     with torch.inference_mode(), torch_autocast_context(torch, device):
         state = predictor.init_state(
-            video_path=str(input_dir),
+            video_path=str(robotseg_input_dir),
             async_loading_frames=False,
             offload_video_to_cpu=False,
             offload_state_to_cpu=False,
@@ -250,10 +278,11 @@ def main():
         """Run RobotSeg on a folder-backed batch and return masks aligned to images."""
         if len(images) == 0:
             return []
+        robotseg_video_dir, _ = prepare_robotseg_jpg_frames(Path(video_dir) / "_robotseg_jpg_frames", images)
         upload_results = {}
         with torch.inference_mode(), torch_autocast_context(torch, device):
             state = predictor.init_state(
-                video_path=str(video_dir),
+                video_path=str(robotseg_video_dir),
                 async_loading_frames=False,
                 offload_video_to_cpu=False,
                 offload_state_to_cpu=False,
